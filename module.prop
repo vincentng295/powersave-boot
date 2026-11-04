@@ -1,0 +1,6 @@
+id=cpu_boot_powersave
+name=CPU Boot Powersave
+version=v1.0
+versionCode=1
+author=nobody
+description=All core to powersave during boot

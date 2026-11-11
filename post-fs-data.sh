@@ -1,30 +1,32 @@
 #!/system/bin/sh
-# Giai đoạn post-fs-data: powersave + xung thấp nhất, và TẮT các core mạnh (cụm có xung tối đa cao nhất)
+# post-fs-data: powersave + xung thấp nhất, TẮT hết core, chỉ giữ lại 1 core yếu nhất
 
 MODDIR=${0%/*}
-STATE=/dev/cpu_boot_powersave   # tmpfs, mất sau khi reboot
-mkdir -p "$STATE"
+. "$MODDIR/lib.sh"
 
-CPUDIR=/sys/devices/system/cpu
+POLICIES=$(list_policies)
 
-POLICIES=$(ls -d $CPUDIR/cpufreq/policy* 2>/dev/null)
-[ -z "$POLICIES" ] && POLICIES=$(ls -d $CPUDIR/cpu[0-9]*/cpufreq 2>/dev/null)
-
-# 1) Ép powersave + xung thấp nhất cho mọi cụm, đồng thời tìm xung max cao nhất
-TOPMAX=0
+# 1) Tìm cụm yếu nhất (xung max thấp nhất)
 LOWMAX=999999999
+WEAK=""
 for P in $POLICIES; do
-  N=$(echo "$P" | sed "s#$CPUDIR/##; s#/#_#g")
-  [ -f "$STATE/$N.gov" ] || {
-    cat "$P/scaling_governor" > "$STATE/$N.gov"
-    cat "$P/scaling_min_freq" > "$STATE/$N.min"
-    cat "$P/scaling_max_freq" > "$STATE/$N.max"
-  }
-
   CMAX=$(cat "$P/cpuinfo_max_freq")
-  [ "$CMAX" -gt "$TOPMAX" ] && TOPMAX=$CMAX
-  [ "$CMAX" -lt "$LOWMAX" ] && LOWMAX=$CMAX
+  if [ "$CMAX" -lt "$LOWMAX" ]; then
+    LOWMAX=$CMAX
+    WEAK=$P
+  fi
+done
 
+# Core được giữ lại = core đầu tiên của cụm yếu nhất
+if [ -f "$WEAK/related_cpus" ]; then
+  KEEP=$(cut -d' ' -f1 < "$WEAK/related_cpus")
+else
+  KEEP=$(echo "$WEAK" | sed "s#$CPUDIR/cpu##; s#/cpufreq##")
+fi
+[ -z "$KEEP" ] && KEEP=0
+
+# 2) Ép powersave + xung thấp nhất cho mọi cụm (làm trước khi tắt core vì policy sẽ biến mất)
+for P in $POLICIES; do
   MINF=$(cat "$P/cpuinfo_min_freq")
   chmod 644 "$P/scaling_governor" "$P/scaling_min_freq" "$P/scaling_max_freq" 2>/dev/null
   echo powersave > "$P/scaling_governor"
@@ -32,25 +34,19 @@ for P in $POLICIES; do
   echo "$MINF"   > "$P/scaling_max_freq"
 done
 
-# 2) Tắt core mạnh: cụm nào có xung max cao hơn cụm yếu nhất thì offline
-#    (nếu chip chỉ có 1 loại cụm thì không tắt gì, tránh tắt nhầm)
-if [ "$TOPMAX" -gt "$LOWMAX" ]; then
-  : > "$STATE/offlined"
-  for P in $POLICIES; do
-    CMAX=$(cat "$P/cpuinfo_max_freq")
-    [ "$CMAX" -le "$LOWMAX" ] && continue
+# 3) Tắt tất cả core trừ KEEP
+: > "$STATE/offlined"
+for O in $CPUDIR/cpu[0-9]*/online; do
+  [ -f "$O" ] || continue
+  C=$(echo "$O" | sed "s#$CPUDIR/cpu##; s#/online##")
+  [ "$C" = "$KEEP" ] && continue
+  echo 0 > "$O" 2>/dev/null && echo "$C" >> "$STATE/offlined"
+done
 
-    if [ -f "$P/related_cpus" ]; then
-      CPUS=$(cat "$P/related_cpus")
-    else
-      CPUS=$(echo "$P" | sed "s#$CPUDIR/cpu##; s#/cpufreq##")
-    fi
-
-    for C in $CPUS; do
-      [ "$C" = "0" ] && continue            # không bao giờ tắt cpu0
-      if [ -f "$CPUDIR/cpu$C/online" ]; then
-        echo 0 > "$CPUDIR/cpu$C/online" && echo "$C" >> "$STATE/offlined"
-      fi
-    done
-  done
-fi
+# 4) Khoá governor/xung của cụm còn lại bằng stub để chống ghi đè lúc boot
+KP=$CPUDIR/cpu$KEEP/cpufreq
+[ -d "$KP" ] || KP=$WEAK
+MINF=$(cat "$KP/cpuinfo_min_freq")
+lock_file "$KP/scaling_governor" powersave
+lock_file "$KP/scaling_min_freq" "$MINF"
+lock_file "$KP/scaling_max_freq" "$MINF"
